@@ -772,7 +772,7 @@ class AuditComparatorApp(tk.Tk):
                 initial_mapping = build_initial_screenshot_mapping(results, screenshots)
                 dialog = ScreenshotMappingDialog(
                     self,
-                    [system.name for system in results],
+                    [system.name for system in results["systems"]],
                     screenshots,
                     initial_mapping,
                 )
