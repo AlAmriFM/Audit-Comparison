@@ -20,6 +20,16 @@ Setup
 
    pip install -r requirements.txt
 
+Optional screenshot check setup
+-------------------------------
+The screenshot check uses OCR to read text from screenshot images. This still runs offline, but it needs the free Tesseract OCR engine installed on the computer.
+
+1. Install Tesseract OCR for Windows.
+2. Make sure tesseract.exe is available on PATH.
+3. Close and reopen Command Prompt or PowerShell after installing it.
+
+If Tesseract is not installed, the normal Excel comparison still works. The report will say that screenshot OCR could not run.
+
 How to run
 ----------
 In Command Prompt or PowerShell, run:
@@ -32,10 +42,20 @@ How to use
 ----------
 1. Click "Browse..." beside "Previous quarter file" and select the older Excel workbook.
 2. Click "Browse..." beside "Current quarter file" and select the newer Excel workbook.
-3. Click "Run comparison and save report".
-4. Choose where to save the HTML report.
-5. If the tool cannot identify a User ID column for a worksheet, it will ask you to map the columns manually. Select the correct User ID column for both files. You can also skip a worksheet if it is not relevant.
-6. When the report is generated, the file selections are cleared automatically so old files are not reused by accident.
+3. Optional: tick "Enable screenshot check" and select either one screenshot image or a folder of screenshots.
+4. Click "Run comparison and save report".
+5. Choose where to save the HTML report.
+6. If the tool cannot identify a User ID column for a worksheet, it will ask you to map the columns manually. Select the correct User ID column for both files. You can also skip a worksheet if it is not relevant.
+7. When the report is generated, the file selections are cleared automatically so old files are not reused by accident.
+
+Screenshot check tips
+---------------------
+- A folder works best when screenshot filenames match worksheet/system names, for example "ERP.png" for an "ERP" worksheet.
+- Supported image files include PNG, JPG, JPEG, BMP, TIFF, and WEBP.
+- The tool checks current-quarter workbook users against the OCR text from the matched screenshot.
+- Clear, high-resolution screenshots work best.
+- OCR can make mistakes if the screenshot is blurry, zoomed out, cropped, dark, or uses tiny text.
+- Treat screenshot misses as items to review, not automatic proof that the user is absent.
 
 What the report shows
 ---------------------
@@ -46,6 +66,7 @@ What the report shows
 - Systems that appear only in the current file
 - Systems that appear only in the previous file
 - Users removed from multiple systems
+- Optional screenshot verification showing whether each current workbook user was seen in the matched screenshot OCR text
 
 Opening and sharing the report
 ------------------------------
@@ -64,6 +85,11 @@ If Python is not recognised:
 If packages are missing:
 - Run: pip install -r requirements.txt
 
+If screenshot OCR does not run:
+- Confirm Tesseract OCR is installed.
+- Confirm tesseract.exe is available on PATH.
+- Close and reopen Command Prompt or PowerShell, then run the tool again.
+
 If a workbook will not open:
 - Make sure the file is not password protected.
 - Close the workbook in Excel and try again.
@@ -79,4 +105,4 @@ If a worksheet is not relevant:
 
 Privacy and offline use
 -----------------------
-The tool reads the selected Excel files locally and writes the report locally. It does not send data anywhere.
+The tool reads the selected Excel files and screenshots locally and writes the report locally. It does not send data anywhere.

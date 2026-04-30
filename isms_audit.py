@@ -9,10 +9,12 @@ Excel submissions and generating a self-contained HTML audit report.
 from __future__ import annotations
 
 import datetime as _dt
+import difflib
 import html
 import json
 import os
 import re
+import shutil
 import sys
 import traceback
 import webbrowser
@@ -33,6 +35,18 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     xlrd = None
 
+try:
+    from PIL import Image, ImageEnhance, ImageOps
+except ImportError:  # pragma: no cover - optional dependency
+    Image = None
+    ImageEnhance = None
+    ImageOps = None
+
+try:
+    import pytesseract
+except ImportError:  # pragma: no cover - optional dependency
+    pytesseract = None
+
 
 ROLE_LABELS = {
     "user_id": "User ID",
@@ -52,6 +66,8 @@ COMPARABLE_ROLES = [
     "expiration",
     "request_id",
 ]
+
+SCREENSHOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 ROLE_ALIASES = {
     "user_id": [
@@ -148,6 +164,29 @@ class UserRecord:
 
 
 @dataclass
+class ScreenshotUserCheck:
+    user_id: str
+    present: bool
+
+
+@dataclass
+class ScreenshotCheckResult:
+    system_name: str
+    screenshot_path: Optional[str] = None
+    status: str = "not_run"
+    message: str = ""
+    users: List[ScreenshotUserCheck] = field(default_factory=list)
+
+    @property
+    def missing_count(self) -> int:
+        return sum(1 for user in self.users if not user.present)
+
+    @property
+    def checked_count(self) -> int:
+        return len(self.users)
+
+
+@dataclass
 class SystemResult:
     name: str
     additions: List[UserRecord] = field(default_factory=list)
@@ -156,6 +195,7 @@ class SystemResult:
     clean: bool = False
     skipped: bool = False
     skip_reason: str = ""
+    screenshot_check: Optional[ScreenshotCheckResult] = None
 
 
 def normalize_header(value: Any) -> str:
@@ -436,10 +476,12 @@ class AuditComparatorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("ISMS Admin Account Audit Comparator")
-        self.geometry("820x430")
-        self.minsize(720, 390)
+        self.geometry("860x560")
+        self.minsize(760, 510)
         self.previous_path = tk.StringVar()
         self.current_path = tk.StringVar()
+        self.screenshot_enabled = tk.BooleanVar(value=False)
+        self.screenshot_path = tk.StringVar()
         self.status = tk.StringVar(value="Select the previous and current quarter Excel files.")
         self.progress = tk.IntVar(value=0)
         self._configure_style()
@@ -476,18 +518,44 @@ class AuditComparatorApp(tk.Tk):
         self._file_row(root, 2, "Previous quarter file", self.previous_path, self.choose_previous)
         self._file_row(root, 3, "Current quarter file", self.current_path, self.choose_current)
 
+        screenshot_box = ttk.LabelFrame(root, text="Optional screenshot evidence check", padding=12)
+        screenshot_box.grid(row=4, column=0, columnspan=3, sticky="we", pady=(14, 0))
+        screenshot_box.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            screenshot_box,
+            text="Enable screenshot check",
+            variable=self.screenshot_enabled,
+            command=self.toggle_screenshot_controls,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(screenshot_box, text="Screenshot file or folder").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.screenshot_entry = ttk.Entry(screenshot_box, textvariable=self.screenshot_path)
+        self.screenshot_entry.grid(row=1, column=1, sticky="we", padx=10, pady=(10, 0))
+        self.screenshot_file_button = ttk.Button(screenshot_box, text="File...", command=self.choose_screenshot_file)
+        self.screenshot_file_button.grid(row=1, column=2, sticky="e", pady=(10, 0))
+        self.screenshot_folder_button = ttk.Button(
+            screenshot_box, text="Folder...", command=self.choose_screenshot_folder
+        )
+        self.screenshot_folder_button.grid(row=1, column=3, sticky="e", padx=(6, 0), pady=(10, 0))
+        ttk.Label(
+            screenshot_box,
+            text="Folder mode auto-matches image filenames to worksheet names. OCR is local and requires Tesseract.",
+            style="Subtitle.TLabel",
+            wraplength=760,
+        ).grid(row=2, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        self.toggle_screenshot_controls()
+
         actions = ttk.Frame(root)
-        actions.grid(row=4, column=0, columnspan=3, sticky="we", pady=(24, 12))
+        actions.grid(row=5, column=0, columnspan=3, sticky="we", pady=(24, 12))
         ttk.Button(actions, text="Run comparison and save report", command=self.run_comparison, style="Accent.TButton").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Button(actions, text="Clear selections", command=self.clear_selection).grid(row=0, column=1, padx=(10, 0))
 
         ttk.Progressbar(root, variable=self.progress, maximum=100).grid(
-            row=5, column=0, columnspan=3, sticky="we", pady=(12, 8)
+            row=6, column=0, columnspan=3, sticky="we", pady=(12, 8)
         )
         ttk.Label(root, textvariable=self.status, style="Status.TLabel", wraplength=760).grid(
-            row=6, column=0, columnspan=3, sticky="we"
+            row=7, column=0, columnspan=3, sticky="we"
         )
 
         note = (
@@ -495,7 +563,7 @@ class AuditComparatorApp(tk.Tk):
             "For legacy .xls files, install the optional xlrd dependency from requirements.txt."
         )
         ttk.Label(root, text=note, style="Subtitle.TLabel", wraplength=760).grid(
-            row=7, column=0, columnspan=3, sticky="we", pady=(28, 0)
+            row=8, column=0, columnspan=3, sticky="we", pady=(28, 0)
         )
 
     def _file_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, command: Any) -> None:
@@ -510,6 +578,36 @@ class AuditComparatorApp(tk.Tk):
     def choose_current(self) -> None:
         self._choose_file(self.current_path, "Select current quarter workbook")
 
+    def choose_screenshot_file(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Select screenshot image",
+            filetypes=[
+                ("Screenshot images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if filename:
+            self.screenshot_path.set(filename)
+            self.screenshot_enabled.set(True)
+            self.toggle_screenshot_controls()
+
+    def choose_screenshot_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Select screenshot folder")
+        if folder:
+            self.screenshot_path.set(folder)
+            self.screenshot_enabled.set(True)
+            self.toggle_screenshot_controls()
+
+    def toggle_screenshot_controls(self) -> None:
+        state = "normal" if self.screenshot_enabled.get() else "disabled"
+        for widget in (
+            getattr(self, "screenshot_entry", None),
+            getattr(self, "screenshot_file_button", None),
+            getattr(self, "screenshot_folder_button", None),
+        ):
+            if widget is not None:
+                widget.configure(state=state)
+
     def _choose_file(self, target: tk.StringVar, title: str) -> None:
         filename = filedialog.askopenfilename(
             title=title,
@@ -522,6 +620,9 @@ class AuditComparatorApp(tk.Tk):
     def clear_selection(self) -> None:
         self.previous_path.set("")
         self.current_path.set("")
+        self.screenshot_enabled.set(False)
+        self.screenshot_path.set("")
+        self.toggle_screenshot_controls()
         self.progress.set(0)
         self.status.set("Selections cleared.")
 
@@ -536,6 +637,15 @@ class AuditComparatorApp(tk.Tk):
         if not previous.exists() or not current.exists():
             messagebox.showwarning("Files required", "Please select both the previous and current quarter Excel files.")
             return
+        screenshot_source: Optional[Path] = None
+        if self.screenshot_enabled.get():
+            screenshot_source = Path(self.screenshot_path.get())
+            if not screenshot_source.exists():
+                messagebox.showwarning(
+                    "Screenshot source required",
+                    "Screenshot check is enabled. Please select a screenshot image or folder.",
+                )
+                return
         report_path = filedialog.asksaveasfilename(
             title="Save HTML report",
             defaultextension=".html",
@@ -554,12 +664,18 @@ class AuditComparatorApp(tk.Tk):
             self.resolve_mappings(previous_tables, current_tables)
             self.set_status("Comparing systems and admin accounts...", 65)
             results = compare_workbooks(previous_tables, current_tables)
+            if screenshot_source:
+                self.set_status("Running local OCR screenshot checks...", 76)
+                add_screenshot_checks(results, current_tables, screenshot_source)
             self.set_status("Building HTML report...", 82)
             report = build_html_report(previous, current, results)
             Path(report_path).write_text(report, encoding="utf-8")
             self.set_status("Report generated. File selections were cleared to prevent stale reuse.", 100)
             self.previous_path.set("")
             self.current_path.set("")
+            self.screenshot_enabled.set(False)
+            self.screenshot_path.set("")
+            self.toggle_screenshot_controls()
             if messagebox.askyesno("Report generated", "The report was generated successfully. Open it now?"):
                 webbrowser.open(Path(report_path).resolve().as_uri())
         except Exception as exc:
@@ -662,6 +778,159 @@ def cross_system_removals(results: List[SystemResult]) -> List[Dict[str, Any]]:
     )
 
 
+def add_screenshot_checks(data: Dict[str, Any], current_tables: Dict[str, SheetTable], source: Path) -> None:
+    systems: List[SystemResult] = data["systems"]
+    if not systems:
+        return
+
+    if Image is None or ImageOps is None or ImageEnhance is None or pytesseract is None:
+        message = "Screenshot OCR skipped. Install Pillow and pytesseract, then install the Tesseract OCR engine."
+        for system in systems:
+            system.screenshot_check = ScreenshotCheckResult(system_name=system.name, status="unavailable", message=message)
+        return
+
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        message = (
+            "Screenshot OCR skipped. The Tesseract OCR engine was not found. "
+            "Install Tesseract and make sure tesseract.exe is available on PATH."
+        )
+        if shutil.which("tesseract") is None:
+            message += " The current PATH does not include tesseract.exe."
+        for system in systems:
+            system.screenshot_check = ScreenshotCheckResult(system_name=system.name, status="unavailable", message=message)
+        return
+
+    screenshots = collect_screenshot_files(source)
+    ocr_cache: Dict[Path, str] = {}
+    for system in systems:
+        table = current_tables.get(system.name)
+        if system.skipped or table is None or not table.roles.get("user_id"):
+            system.screenshot_check = ScreenshotCheckResult(
+                system_name=system.name,
+                status="skipped",
+                message="Screenshot check skipped because this worksheet has no usable User ID mapping.",
+            )
+            continue
+        users = list(build_user_map(table).values())
+        match = match_screenshot_to_system(system.name, screenshots, len(systems))
+        if match is None:
+            system.screenshot_check = ScreenshotCheckResult(
+                system_name=system.name,
+                status="no_screenshot",
+                message="No screenshot filename was close enough to this worksheet name.",
+            )
+            continue
+        try:
+            if match not in ocr_cache:
+                ocr_cache[match] = ocr_image(match)
+            text = ocr_cache[match]
+            user_checks = [
+                ScreenshotUserCheck(user_id=user.display_id, present=user_id_seen_in_text(user.display_id, text))
+                for user in users
+            ]
+            missing = sum(1 for check in user_checks if not check.present)
+            system.screenshot_check = ScreenshotCheckResult(
+                system_name=system.name,
+                screenshot_path=str(match),
+                status="checked",
+                message=f"{len(user_checks) - missing} of {len(user_checks)} current workbook users were found in the screenshot OCR text.",
+                users=user_checks,
+            )
+        except Exception as exc:
+            system.screenshot_check = ScreenshotCheckResult(
+                system_name=system.name,
+                screenshot_path=str(match),
+                status="ocr_error",
+                message=f"OCR failed for this screenshot: {exc}",
+            )
+
+
+def collect_screenshot_files(source: Path) -> List[Path]:
+    if source.is_file():
+        return [source] if source.suffix.lower() in SCREENSHOT_EXTENSIONS else []
+    if not source.is_dir():
+        return []
+    return sorted(
+        [path for path in source.iterdir() if path.is_file() and path.suffix.lower() in SCREENSHOT_EXTENSIONS],
+        key=lambda path: path.name.casefold(),
+    )
+
+
+def normalize_match_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def match_screenshot_to_system(system_name: str, screenshots: List[Path], system_count: int) -> Optional[Path]:
+    if not screenshots:
+        return None
+    if len(screenshots) == 1 and system_count == 1:
+        return screenshots[0]
+    target = normalize_match_name(system_name)
+    if not target:
+        return None
+    by_exact = {normalize_match_name(path.stem): path for path in screenshots}
+    if target in by_exact:
+        return by_exact[target]
+    best_path = None
+    best_score = 0.0
+    for path in screenshots:
+        candidate = normalize_match_name(path.stem)
+        if not candidate:
+            continue
+        if target in candidate or candidate in target:
+            score = min(len(target), len(candidate)) / max(len(target), len(candidate))
+            score = max(score, 0.82)
+        else:
+            score = difflib.SequenceMatcher(None, target, candidate).ratio()
+        if score > best_score:
+            best_path = path
+            best_score = score
+    return best_path if best_score >= 0.62 else None
+
+
+def ocr_image(path: Path) -> str:
+    image = Image.open(path)
+    try:
+        image = ImageOps.exif_transpose(image)
+        image = image.convert("L")
+        image = ImageOps.autocontrast(image)
+        width, height = image.size
+        if width < 1800:
+            scale = max(2, min(4, 1800 // max(width, 1)))
+            image = image.resize((width * scale, height * scale))
+        image = ImageEnhance.Contrast(image).enhance(1.8)
+        image = ImageEnhance.Sharpness(image).enhance(1.5)
+        return pytesseract.image_to_string(image, config="--psm 6")
+    finally:
+        image.close()
+
+
+def normalize_ocr_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def compact_ocr_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def user_id_seen_in_text(user_id: str, ocr_text: str) -> bool:
+    user = cell_to_text(user_id).strip()
+    if not user:
+        return False
+    normalized_user = normalize_ocr_text(user)
+    normalized_text = normalize_ocr_text(ocr_text)
+    if len(normalized_user) >= 3 and normalized_user in normalized_text:
+        return True
+    compact_user = compact_ocr_text(user)
+    compact_text = compact_ocr_text(ocr_text)
+    if len(compact_user) >= 3 and compact_user in compact_text:
+        return True
+    token_pattern = re.compile(r"(?<![a-z0-9])" + re.escape(normalized_user) + r"(?![a-z0-9])", re.IGNORECASE)
+    return bool(token_pattern.search(normalized_text))
+
+
 def request_present(record: UserRecord) -> bool:
     return bool(record.values.get("request_id", "").strip())
 
@@ -682,6 +951,10 @@ def build_html_report(previous_path: Path, current_path: Path, data: Dict[str, A
     total_changes = sum(len(system.changes) for system in systems)
     clean_systems = sum(1 for system in systems if system.clean)
     missing_request_ids = sum(1 for system in systems for record in system.additions if not request_present(record))
+    screenshot_checks = [system.screenshot_check for system in systems if system.screenshot_check is not None]
+    screenshot_missing = sum(
+        check.missing_count for check in screenshot_checks if check is not None and check.status == "checked"
+    )
     finding_systems = sum(
         1
         for system in systems
@@ -696,6 +969,8 @@ def build_html_report(previous_path: Path, current_path: Path, data: Dict[str, A
         ("Missing request IDs", missing_request_ids, "alert"),
         ("Systems with findings", finding_systems, "changes"),
     ]
+    if screenshot_checks:
+        cards.append(("Screenshot misses", screenshot_missing, "alert" if screenshot_missing else "clean"))
     summary_cards = "\n".join(
         f'<div class="stat" data-kind="{kind}"><strong>{value}</strong><span>{label}</span></div>'
         for label, value, kind in cards
@@ -765,20 +1040,22 @@ def render_cross_removals(entries: List[Dict[str, Any]]) -> str:
 
 def render_system(system: SystemResult) -> str:
     if system.skipped:
-        body = f'<p class="muted">{html_escape(system.skip_reason)}</p>'
+        body = f'<p class="muted">{html_escape(system.skip_reason)}</p>' + render_screenshot_check(system)
         badge = pill("Skipped", "neutral")
         open_attr = " open"
     else:
-        body = render_additions(system) + render_removals(system) + render_changes(system)
+        body = render_additions(system) + render_removals(system) + render_changes(system) + render_screenshot_check(system)
+        screenshot_badge = render_screenshot_badge(system)
         if system.clean:
-            body = '<p class="muted">No additions, removals, or tracked field changes detected.</p>'
-            badge = pill("Clean", "ok")
-            open_attr = ""
+            body = '<p class="muted">No additions, removals, or tracked field changes detected.</p>' + render_screenshot_check(system)
+            badge = pill("Clean", "ok") + screenshot_badge
+            open_attr = " open" if screenshot_needs_attention(system) else ""
         else:
             badge = (
                 pill(f"{len(system.additions)} additions", "alert")
                 + pill(f"{len(system.removals)} removals", "warn")
                 + pill(f"{len(system.changes)} changed", "info")
+                + screenshot_badge
             )
             open_attr = " open"
     return f"""
@@ -789,6 +1066,63 @@ def render_system(system: SystemResult) -> str:
       </summary>
       <div class="system-body">{body}</div>
     </details>
+    """
+
+
+def screenshot_needs_attention(system: SystemResult) -> bool:
+    check = system.screenshot_check
+    return bool(check and check.status != "checked" or check and check.missing_count > 0)
+
+
+def render_screenshot_badge(system: SystemResult) -> str:
+    check = system.screenshot_check
+    if check is None:
+        return ""
+    if check.status == "checked":
+        if check.missing_count:
+            return pill(f"{check.missing_count} screenshot missing", "alert")
+        return pill("Screenshot verified", "ok")
+    if check.status == "no_screenshot":
+        return pill("No screenshot", "warn")
+    if check.status in {"unavailable", "ocr_error"}:
+        return pill("OCR not checked", "warn")
+    return pill("Screenshot skipped", "neutral")
+
+
+def render_screenshot_check(system: SystemResult) -> str:
+    check = system.screenshot_check
+    if check is None:
+        return ""
+    source = ""
+    if check.screenshot_path:
+        source = f'<p class="muted screenshot-source">Screenshot: <code>{html_escape(Path(check.screenshot_path).name)}</code></p>'
+    if check.status != "checked":
+        return f"""
+        <h3 class="subsection-label screenshot-label">Screenshot check</h3>
+        <div class="screenshot-notice {html_escape(check.status)}">
+          <p>{html_escape(check.message)}</p>
+          {source}
+        </div>
+        """
+    rows = []
+    for user in check.users:
+        status = pill("Found", "ok") if user.present else pill("Missing", "alert")
+        rows.append(
+            "<tr>"
+            f"<td><code>{html_escape(user.user_id)}</code></td>"
+            f"<td>{status}</td>"
+            "</tr>"
+        )
+    return f"""
+    <h3 class="subsection-label screenshot-label">Screenshot check</h3>
+    <p class="muted screenshot-summary">{html_escape(check.message)}</p>
+    {source}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>User ID from current workbook</th><th>Seen in screenshot OCR</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </div>
     """
 
 
@@ -1244,6 +1578,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     .additions-label { color: var(--red-text); border-color: var(--red-border); }
     .removals-label { color: var(--amber-text); border-color: var(--amber-border); margin-top: var(--space-6); }
     .changes-label { color: var(--blue-text); border-color: var(--blue-border); margin-top: var(--space-6); }
+    .screenshot-label { color: var(--green-text); border-color: var(--green-border); margin-top: var(--space-6); }
+    .screenshot-summary, .screenshot-source { margin-bottom: var(--space-3); }
+    .screenshot-notice {
+      padding: var(--space-4) var(--space-5);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--surface-inset);
+      color: var(--text-secondary);
+      font-size: var(--text-sm);
+    }
+    .screenshot-notice p { margin: 0; }
+    .screenshot-notice.no_screenshot,
+    .screenshot-notice.unavailable,
+    .screenshot-notice.ocr_error {
+      background: var(--amber-surface);
+      border-color: var(--amber-border);
+      color: var(--amber-text);
+    }
     .table-wrap {
       width: 100%;
       overflow-x: auto;
