@@ -554,7 +554,7 @@ class ScreenshotMappingDialog(tk.Toplevel):
     def _label(self, path: Optional[Path]) -> str:
         if path is None:
             return "(none)"
-        return path.name
+        return Path(path).name
 
     def accept(self) -> None:
         mapping: Dict[str, Optional[Path]] = {}
@@ -936,7 +936,8 @@ def add_screenshot_checks(
             )
             continue
         users = list(build_user_map(table).values())
-        match = screenshot_mapping.get(system.name)
+        raw_match = screenshot_mapping.get(system.name)
+        match = Path(raw_match) if raw_match else None
         if match is None:
             system.screenshot_check = ScreenshotCheckResult(
                 system_name=system.name,
@@ -987,6 +988,7 @@ def build_initial_screenshot_mapping(data: Dict[str, Any], screenshots: List[Pat
 
 
 def collect_screenshot_files(source: Path) -> List[Path]:
+    source = Path(source)
     if source.is_file():
         return [source] if source.suffix.lower() in SCREENSHOT_EXTENSIONS else []
     if not source.is_dir():
@@ -1006,6 +1008,7 @@ def match_name_tokens(value: str) -> List[str]:
 
 
 def match_screenshot_to_system(system_name: str, screenshots: List[Path], system_count: int) -> Optional[Path]:
+    screenshots = [Path(path) for path in screenshots]
     if not screenshots:
         return None
     target = normalize_match_name(system_name)
