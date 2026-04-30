@@ -9,7 +9,6 @@ Excel submissions and generating a self-contained HTML audit report.
 from __future__ import annotations
 
 import datetime as _dt
-import difflib
 import html
 import json
 import os
@@ -167,6 +166,8 @@ class UserRecord:
 class ScreenshotUserCheck:
     user_id: str
     present: bool
+    evidence: str = ""
+    match_type: str = ""
 
 
 @dataclass
@@ -176,6 +177,7 @@ class ScreenshotCheckResult:
     status: str = "not_run"
     message: str = ""
     users: List[ScreenshotUserCheck] = field(default_factory=list)
+    ocr_preview: str = ""
 
     @property
     def missing_count(self) -> int:
@@ -472,6 +474,101 @@ class MappingDialog(tk.Toplevel):
         self.destroy()
 
 
+class ScreenshotMappingDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        system_names: List[str],
+        screenshots: List[Path],
+        initial_mapping: Dict[str, Optional[Path]],
+    ):
+        super().__init__(parent)
+        self.title("Review screenshot mapping")
+        self.resizable(True, True)
+        self.result: Optional[Dict[str, Optional[Path]]] = None
+        self.screenshot_by_label = {self._label(path): path for path in screenshots}
+        self.vars_by_system: Dict[str, tk.StringVar] = {}
+
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        outer = ttk.Frame(self, padding=18)
+        outer.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(outer, text="Review screenshot matches", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            outer,
+            text=(
+                "Auto-matching is intentionally conservative. Confirm each worksheet's screenshot, "
+                "or leave it as (none) to skip screenshot checking for that system."
+            ),
+            wraplength=820,
+        ).grid(row=1, column=0, sticky="we", pady=(6, 14))
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        table = ttk.Frame(canvas)
+        table.columnconfigure(1, weight=1)
+        canvas_window = canvas.create_window((0, 0), window=table, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=2, column=0, sticky="nsew")
+        scrollbar.grid(row=2, column=1, sticky="ns")
+
+        def resize_table(event: tk.Event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        def update_scroll(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", resize_table)
+        table.bind("<Configure>", update_scroll)
+
+        ttk.Label(table, text="Worksheet / system").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
+        ttk.Label(table, text="Screenshot").grid(row=0, column=1, sticky="w", pady=(0, 8))
+        options = ["(none)"] + list(self.screenshot_by_label)
+        for row_index, system_name in enumerate(system_names, start=1):
+            ttk.Label(table, text=system_name).grid(row=row_index, column=0, sticky="w", padx=(0, 12), pady=4)
+            initial_path = initial_mapping.get(system_name)
+            initial_label = self._label(initial_path) if initial_path else "(none)"
+            if initial_label not in options:
+                initial_label = "(none)"
+            var = tk.StringVar(value=initial_label)
+            self.vars_by_system[system_name] = var
+            combo = ttk.Combobox(table, textvariable=var, values=options, state="readonly")
+            combo.grid(row=row_index, column=1, sticky="we", pady=4)
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="Cancel", command=self.cancel).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Use these mappings", command=self.accept, style="Accent.TButton").grid(row=0, column=1)
+
+        self.bind("<Escape>", lambda _event: self.cancel())
+        self.update_idletasks()
+        self.minsize(760, min(680, max(420, self.winfo_height())))
+
+    def _label(self, path: Optional[Path]) -> str:
+        if path is None:
+            return "(none)"
+        return path.name
+
+    def accept(self) -> None:
+        mapping: Dict[str, Optional[Path]] = {}
+        for system_name, var in self.vars_by_system.items():
+            label = var.get()
+            mapping[system_name] = None if label == "(none)" else self.screenshot_by_label.get(label)
+        self.result = mapping
+        self.destroy()
+
+    def cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class AuditComparatorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -665,8 +762,26 @@ class AuditComparatorApp(tk.Tk):
             self.set_status("Comparing systems and admin accounts...", 65)
             results = compare_workbooks(previous_tables, current_tables)
             if screenshot_source:
+                screenshots = collect_screenshot_files(screenshot_source)
+                if not screenshots:
+                    messagebox.showwarning(
+                        "No screenshots found",
+                        "Screenshot check is enabled, but no supported image files were found.",
+                    )
+                    return
+                initial_mapping = build_initial_screenshot_mapping(results, screenshots)
+                dialog = ScreenshotMappingDialog(
+                    self,
+                    [system.name for system in results],
+                    screenshots,
+                    initial_mapping,
+                )
+                self.wait_window(dialog)
+                if dialog.result is None:
+                    self.status.set("Screenshot mapping cancelled.")
+                    return
                 self.set_status("Running local OCR screenshot checks...", 76)
-                add_screenshot_checks(results, current_tables, screenshot_source)
+                add_screenshot_checks(results, current_tables, screenshot_source, dialog.result)
             self.set_status("Building HTML report...", 82)
             report = build_html_report(previous, current, results)
             Path(report_path).write_text(report, encoding="utf-8")
@@ -778,7 +893,12 @@ def cross_system_removals(results: List[SystemResult]) -> List[Dict[str, Any]]:
     )
 
 
-def add_screenshot_checks(data: Dict[str, Any], current_tables: Dict[str, SheetTable], source: Path) -> None:
+def add_screenshot_checks(
+    data: Dict[str, Any],
+    current_tables: Dict[str, SheetTable],
+    source: Path,
+    screenshot_mapping: Optional[Dict[str, Optional[Path]]] = None,
+) -> None:
     systems: List[SystemResult] = data["systems"]
     if not systems:
         return
@@ -803,6 +923,8 @@ def add_screenshot_checks(data: Dict[str, Any], current_tables: Dict[str, SheetT
         return
 
     screenshots = collect_screenshot_files(source)
+    if screenshot_mapping is None:
+        screenshot_mapping = build_initial_screenshot_mapping(data, screenshots)
     ocr_cache: Dict[Path, str] = {}
     for system in systems:
         table = current_tables.get(system.name)
@@ -814,22 +936,29 @@ def add_screenshot_checks(data: Dict[str, Any], current_tables: Dict[str, SheetT
             )
             continue
         users = list(build_user_map(table).values())
-        match = match_screenshot_to_system(system.name, screenshots, len(systems))
+        match = screenshot_mapping.get(system.name)
         if match is None:
             system.screenshot_check = ScreenshotCheckResult(
                 system_name=system.name,
                 status="no_screenshot",
-                message="No screenshot filename was close enough to this worksheet name.",
+                message="No screenshot was mapped to this worksheet.",
             )
             continue
         try:
             if match not in ocr_cache:
                 ocr_cache[match] = ocr_image(match)
             text = ocr_cache[match]
-            user_checks = [
-                ScreenshotUserCheck(user_id=user.display_id, present=user_id_seen_in_text(user.display_id, text))
-                for user in users
-            ]
+            user_checks = []
+            for user in users:
+                present, evidence, match_type = user_id_seen_in_text(user.display_id, text)
+                user_checks.append(
+                    ScreenshotUserCheck(
+                        user_id=user.display_id,
+                        present=present,
+                        evidence=evidence,
+                        match_type=match_type,
+                    )
+                )
             missing = sum(1 for check in user_checks if not check.present)
             system.screenshot_check = ScreenshotCheckResult(
                 system_name=system.name,
@@ -837,6 +966,7 @@ def add_screenshot_checks(data: Dict[str, Any], current_tables: Dict[str, SheetT
                 status="checked",
                 message=f"{len(user_checks) - missing} of {len(user_checks)} current workbook users were found in the screenshot OCR text.",
                 users=user_checks,
+                ocr_preview=preview_ocr_text(text),
             )
         except Exception as exc:
             system.screenshot_check = ScreenshotCheckResult(
@@ -845,6 +975,15 @@ def add_screenshot_checks(data: Dict[str, Any], current_tables: Dict[str, SheetT
                 status="ocr_error",
                 message=f"OCR failed for this screenshot: {exc}",
             )
+
+
+def build_initial_screenshot_mapping(data: Dict[str, Any], screenshots: List[Path]) -> Dict[str, Optional[Path]]:
+    systems: List[SystemResult] = data["systems"]
+    system_count = len(systems)
+    return {
+        system.name: match_screenshot_to_system(system.name, screenshots, system_count)
+        for system in systems
+    }
 
 
 def collect_screenshot_files(source: Path) -> List[Path]:
@@ -862,32 +1001,30 @@ def normalize_match_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def match_name_tokens(value: str) -> List[str]:
+    return [token for token in re.split(r"[^a-z0-9]+", value.lower()) if len(token) >= 3]
+
+
 def match_screenshot_to_system(system_name: str, screenshots: List[Path], system_count: int) -> Optional[Path]:
     if not screenshots:
         return None
-    if len(screenshots) == 1 and system_count == 1:
-        return screenshots[0]
     target = normalize_match_name(system_name)
     if not target:
         return None
     by_exact = {normalize_match_name(path.stem): path for path in screenshots}
     if target in by_exact:
         return by_exact[target]
-    best_path = None
-    best_score = 0.0
+    target_tokens = set(match_name_tokens(system_name))
+    candidates: List[Path] = []
     for path in screenshots:
         candidate = normalize_match_name(path.stem)
-        if not candidate:
+        if len(target) >= 5 and len(candidate) >= 5 and (candidate.startswith(target) or target.startswith(candidate)):
+            candidates.append(path)
             continue
-        if target in candidate or candidate in target:
-            score = min(len(target), len(candidate)) / max(len(target), len(candidate))
-            score = max(score, 0.82)
-        else:
-            score = difflib.SequenceMatcher(None, target, candidate).ratio()
-        if score > best_score:
-            best_path = path
-            best_score = score
-    return best_path if best_score >= 0.62 else None
+        candidate_tokens = set(match_name_tokens(path.stem))
+        if target_tokens and target_tokens == candidate_tokens:
+            candidates.append(path)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def ocr_image(path: Path) -> str:
@@ -915,20 +1052,55 @@ def compact_ocr_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def user_id_seen_in_text(user_id: str, ocr_text: str) -> bool:
+def excerpt_around(text: str, start: int, end: int, radius: int = 44) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    prefix = "..." if left > 0 else ""
+    suffix = "..." if right < len(text) else ""
+    return prefix + re.sub(r"\s+", " ", text[left:right]).strip() + suffix
+
+
+def preview_ocr_text(text: str, limit: int = 2500) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "..."
+
+
+def compact_index_map(text: str) -> Tuple[str, List[int]]:
+    compact_chars: List[str] = []
+    positions: List[int] = []
+    for index, char in enumerate(text):
+        if char.isalnum():
+            compact_chars.append(char.lower())
+            positions.append(index)
+    return "".join(compact_chars), positions
+
+
+def user_id_seen_in_text(user_id: str, ocr_text: str) -> Tuple[bool, str, str]:
     user = cell_to_text(user_id).strip()
     if not user:
-        return False
+        return False, "", ""
     normalized_user = normalize_ocr_text(user)
-    normalized_text = normalize_ocr_text(ocr_text)
-    if len(normalized_user) >= 3 and normalized_user in normalized_text:
-        return True
+    cleaned_text = re.sub(r"\s+", " ", ocr_text).strip()
+    normalized_text = cleaned_text.lower()
+    if len(normalized_user) >= 3:
+        token_pattern = re.compile(r"(?<![a-z0-9])" + re.escape(normalized_user) + r"(?![a-z0-9])", re.IGNORECASE)
+        match = token_pattern.search(normalized_text)
+        if match:
+            return True, excerpt_around(cleaned_text, match.start(), match.end()), "exact"
+        loose_index = normalized_text.find(normalized_user)
+        if loose_index >= 0:
+            return True, excerpt_around(cleaned_text, loose_index, loose_index + len(normalized_user)), "text"
     compact_user = compact_ocr_text(user)
-    compact_text = compact_ocr_text(ocr_text)
-    if len(compact_user) >= 3 and compact_user in compact_text:
-        return True
-    token_pattern = re.compile(r"(?<![a-z0-9])" + re.escape(normalized_user) + r"(?![a-z0-9])", re.IGNORECASE)
-    return bool(token_pattern.search(normalized_text))
+    compact_text, positions = compact_index_map(cleaned_text)
+    if len(compact_user) >= 5:
+        compact_index = compact_text.find(compact_user)
+        if compact_index >= 0:
+            start = positions[compact_index]
+            end = positions[min(compact_index + len(compact_user) - 1, len(positions) - 1)] + 1
+            return True, excerpt_around(cleaned_text, start, end), "compact"
+    return False, "", ""
 
 
 def request_present(record: UserRecord) -> bool:
@@ -1107,22 +1279,40 @@ def render_screenshot_check(system: SystemResult) -> str:
     rows = []
     for user in check.users:
         status = pill("Found", "ok") if user.present else pill("Missing", "alert")
+        evidence = ""
+        if user.present:
+            evidence = (
+                f'<span class="match-type">{html_escape(user.match_type or "match")}</span> '
+                f'{html_escape(user.evidence)}'
+            )
+        else:
+            evidence = '<span class="empty-dash">No OCR text matched this User ID.</span>'
         rows.append(
             "<tr>"
             f"<td><code>{html_escape(user.user_id)}</code></td>"
             f"<td>{status}</td>"
+            f"<td>{evidence}</td>"
             "</tr>"
         )
+    preview = ""
+    if check.ocr_preview:
+        preview = f"""
+        <details class="ocr-preview">
+          <summary>View OCR text preview</summary>
+          <pre>{html_escape(check.ocr_preview)}</pre>
+        </details>
+        """
     return f"""
     <h3 class="subsection-label screenshot-label">Screenshot check</h3>
     <p class="muted screenshot-summary">{html_escape(check.message)}</p>
     {source}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>User ID from current workbook</th><th>Seen in screenshot OCR</th></tr></thead>
+        <thead><tr><th>User ID from current workbook</th><th>Seen in screenshot OCR</th><th>OCR evidence</th></tr></thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
     </div>
+    {preview}
     """
 
 
@@ -1596,6 +1786,39 @@ HTML_TEMPLATE = r"""<!doctype html>
       border-color: var(--amber-border);
       color: var(--amber-text);
     }
+    .match-type {
+      display: inline-flex;
+      margin-right: var(--space-1);
+      padding: 1px var(--space-2);
+      border-radius: var(--radius-pill);
+      background: var(--surface-inset);
+      color: var(--text-secondary);
+      font-size: var(--text-2xs);
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .ocr-preview {
+      margin-top: var(--space-4);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--surface-inset);
+      overflow: clip;
+    }
+    .ocr-preview summary {
+      min-height: 42px;
+      padding: var(--space-3) var(--space-4);
+      font-size: var(--text-xs);
+    }
+    .ocr-preview pre {
+      margin: 0;
+      padding: var(--space-4);
+      border-top: 1px solid var(--border-subtle);
+      white-space: pre-wrap;
+      color: var(--text-secondary);
+      font: 600 var(--text-2xs) / 1.55 var(--font-mono);
+    }
+    .empty-dash { color: var(--text-tertiary); }
     .table-wrap {
       width: 100%;
       overflow-x: auto;

@@ -51,11 +51,14 @@ How to use
 Screenshot check tips
 ---------------------
 - A folder works best when screenshot filenames match worksheet/system names, for example "ERP.png" for an "ERP" worksheet.
+- Before OCR runs, the tool shows a screenshot mapping review window. Confirm or correct each worksheet-to-screenshot match there.
+- The auto-match is intentionally conservative. If it is unsure, it leaves the worksheet as "(none)" instead of guessing.
 - Supported image files include PNG, JPG, JPEG, BMP, TIFF, and WEBP.
 - The tool checks current-quarter workbook users against the OCR text from the matched screenshot.
 - Clear, high-resolution screenshots work best.
 - OCR can make mistakes if the screenshot is blurry, zoomed out, cropped, dark, or uses tiny text.
-- Treat screenshot misses as items to review, not automatic proof that the user is absent.
+- The report shows the OCR text fragment that caused each "Found" result, plus a preview of the OCR text. Use this to confirm that the match is meaningful.
+- Treat screenshot misses and weak-looking OCR evidence as items to review, not automatic proof that the user is absent.
 
 What the report shows
 ---------------------
